@@ -170,6 +170,98 @@ func NewContext(parent context.Context, opts ...ContextOption) (context.Context,
 	return ctx, cancelWait
 }
 
+// NewContextWithTimeout creates a chromedp context from the parent context. The parent
+// context's Allocator is inherited, defaulting to an ExecAllocator with
+// DefaultExecAllocatorOptions.
+//
+// If the parent context contains an allocated Browser, the child context
+// inherits it, and its first Run creates a new tab on that browser. Otherwise,
+// its first Run will allocate a new browser.
+//
+// Cancelling the returned context will close a tab or an entire browser,
+// depending on the logic described above. To cancel a context while checking
+// for errors, see Cancel.
+//
+// Note that NewContextWithTimeout doesn't allocate nor start a browser; that happens the
+// first time Run is used on the context.
+func NewContextWithTimeout(parent context.Context, timeout int, opts ...ContextOption) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
+
+	c := &Context{cancel: cancel, first: true}
+	if pc := FromContext(parent); pc != nil {
+		c.Allocator = pc.Allocator
+		c.Browser = pc.Browser
+		// don't inherit Target, so that NewContext can be used to
+		// create a new tab on the same browser.
+
+		c.first = c.Browser == nil
+
+		// TODO: make this more generic somehow.
+		if _, ok := c.Allocator.(*RemoteAllocator); ok {
+			c.first = false
+		}
+	}
+	if c.Browser == nil {
+		// set up the semaphore for Allocator.Allocate
+		c.allocated = make(chan struct{}, 1)
+		c.allocated <- struct{}{}
+	}
+
+	for _, o := range opts {
+		o(c)
+	}
+	if c.Allocator == nil {
+		c.Allocator = setupExecAllocator(DefaultExecAllocatorOptions[:]...)
+	}
+
+	ctx = context.WithValue(ctx, contextKey{}, c)
+	c.closedTarget.Add(1)
+	go func() {
+		<-ctx.Done()
+		defer c.closedTarget.Done()
+		if c.first {
+			// This is the original browser tab, so the entire
+			// browser will already be cleaned up elsewhere.
+			return
+		}
+
+		if c.Target == nil {
+			// This is a new tab, but we didn't create it and attach
+			// to it yet. Nothing to do.
+			return
+		}
+
+		// Not the original browser tab; simply detach and close it.
+		// We need a new context, as ctx is cancelled; use a 1s timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if id := c.Target.SessionID; id != "" {
+			action := target.DetachFromTarget().WithSessionID(id)
+			if err := action.Do(cdp.WithExecutor(ctx, c.Browser)); c.cancelErr == nil {
+				c.cancelErr = err
+			}
+		}
+		if id := c.Target.TargetID; id != "" {
+			action := target.CloseTarget(id)
+			if ok, err := action.Do(cdp.WithExecutor(ctx, c.Browser)); c.cancelErr == nil {
+				if !ok && err == nil {
+					err = fmt.Errorf("could not close target %q", id)
+				}
+				c.cancelErr = err
+			}
+		}
+	}()
+	cancelWait := func() {
+		cancel()
+		c.closedTarget.Wait()
+		// If we allocated, wait for the browser to stop.
+		if c.allocated != nil {
+			<-c.allocated
+		}
+	}
+	return ctx, cancelWait
+}
+
 type contextKey struct{}
 
 // FromContext extracts the Context data stored inside a context.Context.
